@@ -3,49 +3,42 @@ from flgo.utils.fmodule import FModule
 import torchvision.models as models
 import torch
 
+
 class CIFAR100FResNet18(FModule):
-    def __init__(self, num_classes=100):
+    def __init__(self, num_classes=100):  # 默认类别数为100
         super().__init__()
 
         # 加载预定义的 resnet18 模型，不加载预训练权重
-        self.resnet = models.resnet18(pretrained=False)
+        resnet = models.resnet18(pretrained=False)
 
-        # 修改第一层卷积，使其适应 32x32 的输入
-        self.resnet.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        # 将 maxpool 层替换为 Identity 层，避免过早下采样
-        self.resnet.maxpool = nn.Identity()
-        # 修改全连接层，输出类别数为 num_classes
-        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, num_classes)
+        # 1. 定义特征提取器 (feature_extractor)
+        # 它包含 ResNet 中除了最后一个全连接层之外的所有层
+        self.feature_extractor = nn.Sequential(
+            # 修改第一层卷积以适应CIFAR100 (32x32)
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            resnet.bn1,
+            resnet.relu,
+            # 替换原来的 maxpool，避免过早减小特征图尺寸
+            nn.Identity(),
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3,
+            resnet.layer4,
+            resnet.avgpool
+        )
 
-
-    def extract_features(self, x):
-        """
-        特征提取阶段：完成除全连接层外的所有前向传播操作，
-        最后得到的输出经过全局平均池化并展平为特征向量。
-        """
-        x = self.resnet.conv1(x)
-        x = self.resnet.bn1(x)
-        x = self.resnet.relu(x)
-        x = self.resnet.maxpool(x)
-
-        x = self.resnet.layer1(x)
-        x = self.resnet.layer2(x)
-        x = self.resnet.layer3(x)
-        x = self.resnet.layer4(x)
-
-        x = self.resnet.avgpool(x)
-        x = torch.flatten(x, 1)  # 或 x.view(x.size(0), -1)
-        return x
+        # 2. 定义分类头 (head)
+        # 它就是原来的全连接层，输出类别为 num_classes
+        self.head = nn.Linear(resnet.fc.in_features, num_classes)
 
     def forward(self, x):
         """
-        前向传播：特征提取、路径嵌入（可选）和分类。
-
-        :param x: 输入张量，形状 [batch_size, 3, 32, 32]
-        :return: 输出 logits，形状 [batch_size, num_classes]
+        前向传播：先通过特征提取器，然后展平，最后通过分类头。
         """
-        features = self.extract_features(x)
-        out = self.resnet.fc(features)
+        features = self.feature_extractor(x)
+        # 在特征提取器和分类头之间需要一个展平操作
+        features_flattened = torch.flatten(features, 1)
+        out = self.head(features_flattened)
         return out
 
 
@@ -56,10 +49,11 @@ def init_local_module(object):
 
 def init_global_module(object):
     if 'Server' in object.__class__.__name__:
-        print(object.__class__.__name__)
+        # 确保服务器加载的是这个修改后的新模型
         object.model = CIFAR100FResNet18().to(object.device)
 
 
+# 为了兼容性，保留这个类
 class CIFAR100ResNet18:
     init_local_module = init_local_module
     init_global_module = init_global_module
