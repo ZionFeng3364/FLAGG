@@ -88,64 +88,59 @@ class Server(fedbase.BasicServer):
             for pname, pval in cpkg.items():
                 res[pname].append(pval)
         return res
-    
+
     def aggregate(self, models: list, *args, **kwargs):
-        r"""
-        Aggregate the locally trained models into the new one. The aggregation
-        will be according to self.aggregate_option where
-
-        pk = nk/n where n=self.data_vol
-        K = |S_t|
-        N = |S|
-        -------------------------------------------------------------------------------------------------------------------------
-         weighted_scale                 |uniform (default)          |weighted_com (original fedavg)   |other
-        ==========================================================================================================================
-        N/K * Σpk * model_k             |1/K * Σmodel_k             |(1-Σpk) * w_old + Σpk * model_k  |Σ(pk/Σpk) * model_k
-
-
-        Args:
-            models (list): a list of local models
-
-        Returns:
-            the aggregated model
-
-        Example:
-        ```python
-            >>> models = [m1, m2] # m1, m2 are models with the same architecture
-            >>> m_new = self.aggregate(models)
-        ```
         """
-        if len(models) == 0: return self.model
-        nan_exists = [m.has_nan() for m in models]
-        if any(nan_exists):
-            if all(nan_exists): raise ValueError("All the received local models have parameters of nan value.")
-            self.gv.logger.info('Warning("There exists nan-value in local models, which will be automatically removed from the aggregatino list.")')
-            new_models = []
-            received_clients = []
-            for ni, mi, cid in zip(nan_exists, models, self.received_clients):
-                if ni: continue
-                new_models.append(mi)
-                received_clients.append(cid)
-            self.received_clients = received_clients
-            models = new_models
-        local_data_vols = [c.datavol for c in self.clients]
-        total_data_vol = sum(local_data_vols)
-        if self.aggregation_option == 'weighted_scale':
-            p = [1.0 * local_data_vols[cid] / total_data_vol for cid in self.received_clients]
-            K = len(models)
-            N = self.num_clients
-            return fmodule._model_sum([model_k * pk for model_k, pk in zip(models, p)]) * N / K
-        elif self.aggregation_option == 'uniform':
-            return fmodule._model_average(models)
-        elif self.aggregation_option == 'weighted_com':
-            p = [1.0 * local_data_vols[cid] / total_data_vol for cid in self.received_clients]
-            w = fmodule._model_sum([model_k * pk for model_k, pk in zip(models, p)])
-            return (1.0 - sum(p)) * self.model + w
-        else:
-            p = [1.0 * local_data_vols[cid] / total_data_vol for cid in self.received_clients]
-            sump = sum(p)
-            p = [pk / sump for pk in p]
-            return fmodule._model_sum([model_k * pk for model_k, pk in zip(models, p)])
+        核心聚合逻辑：通过 state_dict 对 feature_extractor 的浮点数参数进行加权平均。
+        非浮点数类型的缓冲区直接复制。
+        """
+        if not models:
+            return self.model
+
+        # 1. 获取所有客户端上传的 feature_extractor 的 state_dict
+        client_fe_state_dicts = [m.feature_extractor.state_dict() for m in models]
+
+        # 2. 计算聚合权重
+        weights = self.clients_contribution_to_weights(models)
+
+        # 3. 初始化一个新的 state_dict 用于存放聚合结果，以第一个客户端的为模板
+        aggregated_fe_state_dict = copy.deepcopy(client_fe_state_dicts[0])
+
+        # 4. 遍历所有参数/缓冲区
+        for key in aggregated_fe_state_dict.keys():
+            # 【关键修正】检查当前项的数据类型
+            if aggregated_fe_state_dict[key].dtype == torch.float32 or aggregated_fe_state_dict[
+                key].dtype == torch.float64:
+                # 如果是浮点数类型，则进行加权聚合
+                aggregated_fe_state_dict[key].zero_()
+                for i in range(len(client_fe_state_dicts)):
+                    aggregated_fe_state_dict[key] += client_fe_state_dicts[i][key] * weights[i]
+            else:
+                # 如果不是浮点数（例如 Long 类型的 num_batches_tracked），
+                # 我们不进行加权平均，直接采用第一个客户端的值即可。
+                # 因为 aggregated_fe_state_dict 是从第一个客户端深拷贝的，所以这里无需任何操作。
+                pass
+
+        # 5. 将聚合后的新 state_dict 加载回服务器模型的 feature_extractor
+        self.model.feature_extractor.load_state_dict(aggregated_fe_state_dict)
+
+        return self.model
+
+    def clients_contribution_to_weights(self, models):
+        """辅助函数：根据配置计算客户端的聚合权重。"""
+        # 默认使用均匀权重
+        weights = [1.0 / len(models)] * len(models)
+
+        # 如果配置为数据量加权
+        if self.aggregation_option != 'uniform':
+            local_data_vols = [self.clients[cid].datavol for cid in self.received_clients]
+            total_data_vol = sum(local_data_vols)
+            if total_data_vol > 0:
+                if self.aggregation_option == 'weighted_com':
+                    weights = [vol / total_data_vol for vol in local_data_vols]
+                else:
+                    weights = [vol / sum(local_data_vols) for vol in local_data_vols]
+        return weights
 
 
 
@@ -155,6 +150,8 @@ class Client(fedbase.BasicClient):
         super().__init__(*args, **kwargs)
         self.current_round = 0
         self.task = self.option['task']
+        self.head = None
+
 
     @fmodule.with_multi_gpus
     def train(self, model):
@@ -225,22 +222,35 @@ class Client(fedbase.BasicClient):
             self.data_loader = None
             self._train_loader = None
         return batch_data
-    
+
     def pack(self, model, *args, **kwargs):
-        r"""
-        Packing the package to be send to the server. The operations of compression
-        of encryption of the package should be done here.
-
-        Args:
-            model: the locally trained model
-
-        Returns:
-            package: a dict that contains the necessary information for the server
         """
+        打包本地更新：在上传前，保存更新后的私有 head。
+        """
+        # 核心操作：在本地训练完成后，模型中的 head 已经是更新过的了。
+        # 我们需要把它深拷贝一份，保存到 self.head，以供下一轮使用。
+        self.head = copy.deepcopy(model.head)
+
+        # 将整个更新后的模型打包返回给服务器。
+        # 服务器会自己处理，只取 feature_extractor 部分。
         return {
             "model": model,
         }
 
     def unpack(self, received_pkg):
-        self.current_round = received_pkg['current_round']
-        return received_pkg['model']
+        """
+        解包服务器消息：接收全局模型，并将其 head 替换为自己的私有 head。
+        """
+        global_model = received_pkg['model']
+
+        # 如果是第一轮，客户端还没有自己的私有 head，
+        # 就从服务器下发的模型中复制一个作为初始化的 head。
+        if self.head is None:
+            self.head = copy.deepcopy(global_model.head)
+
+        # 核心操作：用自己的私有 head 替换全局模型的 head
+        model_to_train = global_model
+        model_to_train.head = self.head
+
+        # 将组合后的模型传递给后续的 train 方法
+        return model_to_train
