@@ -21,6 +21,7 @@ class ExpertMLP(nn.Module): # <-- 继承自 nn.Module
 class Server(fedbase.BasicServer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.client_experts = {}
 
     def initialize(self, *args, **kwargs):
         r"""API for customizing the initializing process of the object"""
@@ -28,19 +29,41 @@ class Server(fedbase.BasicServer):
 
     def iterate(self):
         """
-        The standard iteration of each federated communication round that contains three
-        necessary procedure in FL: client selection, communication and model aggregation.
-
-        Returns:
-            False if the global model is not updated in this iteration
+        修改后的迭代流程，用于接收和存储专家模型。
         """
-        # sample clients: MD sampling as default
+        # 1. 采样客户端 (无变化)
         self.selected_clients = self.sample()
-        # training
-        models = self.communicate(self.selected_clients)['model']
-        # aggregate: pk = 1/K as default where K=len(selected_clients)
-        self.model = self.aggregate(models)
-        return len(models) > 0
+        if not self.selected_clients:
+            return False
+
+        # 2. 与客户端通信，接收完整的包 (有变化)
+        # 旧代码: models = self.communicate(self.selected_clients)['model']
+        # 新代码: 我们接收完整的 packages，而不仅仅是 'model'
+        packages_received = self.communicate(self.selected_clients)
+
+        # 从收到的包中解压出主模型、专家模型和客户端ID
+        # .get(key, []) 是一种安全写法，如果某个key不存在，会返回一个空列表
+        main_models = packages_received.get('model', [])
+        expert_models = packages_received.get('distilled_expert', [])
+
+        # flgo 的通信机制会自动添加 '__cid' 键，包含发送方客户端的ID列表
+        client_ids = packages_received.get('__cid', [])
+        # 3. 存储/更新客户端的专家模型 (新逻辑)
+        if expert_models and client_ids:
+            for cid, expert in zip(client_ids, expert_models):
+                # 将专家模型存储在字典中，如果已存在则覆盖
+                # 将模型移动到服务器的设备上 (如GPU)，以备将来使用
+                self.client_experts[cid] = expert.to(self.device)
+                # (可选) 打印日志，确认收到
+                # self.gv.logger.info(f"Server: Received and stored expert from Client {cid}.")
+
+        # 4. 聚合主模型 (无变化)
+        if main_models:
+            self.model = self.aggregate(main_models)
+            return True
+        else:
+            # 如果没有收到任何模型，则此轮无效
+            return False
 
     def pack(self, client_id, mtype=0, *args, **kwargs):
         r"""
@@ -403,6 +426,7 @@ class Client(fedbase.BasicClient):
         # 服务器会自己处理，只取 feature_extractor 部分。
         return {
             "model": model,
+            "distilled_expert": self.distilled_expert
         }
 
     def unpack(self, received_pkg):
