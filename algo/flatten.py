@@ -1,3 +1,4 @@
+import collections
 import copy, torch
 from flgo.algorithm import fedbase
 from flgo.utils import fmodule
