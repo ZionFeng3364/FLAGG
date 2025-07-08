@@ -4,6 +4,7 @@ from flgo.algorithm import fedbase
 from flgo.utils import fmodule
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import random_split
 
 class ExpertMLP(nn.Module): # <-- 继承自 nn.Module
     def __init__(self, dim_in=512, dim_hidden=128, dim_out=10):
@@ -24,7 +25,38 @@ class Server(fedbase.BasicServer):
         self.client_experts = {}
 
     def initialize(self, *args, **kwargs):
-        r"""API for customizing the initializing process of the object"""
+        """
+        在服务器初始化时，将原始的 test_data 划分为新的 val_data 和 test_data。
+        """
+        # 检查原始的 test_data 是否存在且不为空
+        original_test_data = getattr(self, 'test_data', None)
+        if not original_test_data:
+            self.gv.logger.warning("Server has no 'test_data' to split for validation.")
+            return
+
+        # 定义划分比例，例如 50% 作为验证集，50% 作为新的测试集
+        # 这是一个可以调整的超参数
+        split_ratio = 0.5
+        val_size = int(len(original_test_data) * split_ratio)
+        test_size = len(original_test_data) - val_size
+
+        # 使用固定的随机种子，确保每次运行的划分结果都一样，便于复现
+        generator = torch.Generator().manual_seed(42)
+
+        # 使用 PyTorch 的 random_split 函数进行划分
+        try:
+            self.val_data, self.test_data = random_split(
+                original_test_data,
+                [val_size, test_size],
+                generator=generator
+            )
+            self.gv.logger.info(f"Server's original test data (size: {len(original_test_data)}) has been split.")
+            self.gv.logger.info(f"New server validation set ('val_data') size: {len(self.val_data)}")
+            self.gv.logger.info(f"New server test set ('test_data') size: {len(self.test_data)}")
+        except Exception as e:
+            self.gv.logger.error(f"Failed to split server's test data: {e}")
+            # 如果划分失败，保留原始的 test_data
+            self.test_data = original_test_data
         return
 
     def iterate(self):
