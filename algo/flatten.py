@@ -3,7 +3,20 @@ import copy, torch
 from flgo.algorithm import fedbase
 from flgo.utils import fmodule
 import torch.nn as nn
+import torch.nn.functional as F
 
+class ExpertMLP(nn.Module): # <-- 继承自 nn.Module
+    def __init__(self, dim_in=512, dim_hidden=128, dim_out=10):
+        super().__init__()
+        self.fc1 = nn.Linear(dim_in, dim_hidden)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(dim_hidden, dim_out)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        return x
 
 class Server(fedbase.BasicServer):
     def __init__(self, *args, **kwargs):
@@ -91,41 +104,63 @@ class Server(fedbase.BasicServer):
         return res
 
     def aggregate(self, models: list, *args, **kwargs):
+        r"""
+        Aggregate the locally trained models into the new one. The aggregation
+        will be according to self.aggregate_option where
+
+        pk = nk/n where n=self.data_vol
+        K = |S_t|
+        N = |S|
+        -------------------------------------------------------------------------------------------------------------------------
+         weighted_scale                 |uniform (default)          |weighted_com (original fedavg)   |other
+        ==========================================================================================================================
+        N/K * Σpk * model_k             |1/K * Σmodel_k             |(1-Σpk) * w_old + Σpk * model_k  |Σ(pk/Σpk) * model_k
+
+
+        Args:
+            models (list): a list of local models
+
+        Returns:
+            the aggregated model
+
+        Example:
+        ```python
+            >>> models = [m1, m2] # m1, m2 are models with the same architecture
+            >>> m_new = self.aggregate(models)
+        ```
         """
-        核心聚合逻辑：通过 state_dict 对 feature_extractor 的浮点数参数进行加权平均。
-        非浮点数类型的缓冲区直接复制。
-        """
-        if not models:
-            return self.model
-
-        # 1. 获取所有客户端上传的 feature_extractor 的 state_dict
-        client_fe_state_dicts = [m.feature_extractor.state_dict() for m in models]
-
-        # 2. 计算聚合权重
-        weights = self.clients_contribution_to_weights(models)
-
-        # 3. 初始化一个新的 state_dict 用于存放聚合结果，以第一个客户端的为模板
-        aggregated_fe_state_dict = copy.deepcopy(client_fe_state_dicts[0])
-
-        # 4. 遍历所有参数/缓冲区
-        for key in aggregated_fe_state_dict.keys():
-            # 【关键修正】检查当前项的数据类型
-            if aggregated_fe_state_dict[key].dtype == torch.float32 or aggregated_fe_state_dict[
-                key].dtype == torch.float64:
-                # 如果是浮点数类型，则进行加权聚合
-                aggregated_fe_state_dict[key].zero_()
-                for i in range(len(client_fe_state_dicts)):
-                    aggregated_fe_state_dict[key] += client_fe_state_dicts[i][key] * weights[i]
-            else:
-                # 如果不是浮点数（例如 Long 类型的 num_batches_tracked），
-                # 我们不进行加权平均，直接采用第一个客户端的值即可。
-                # 因为 aggregated_fe_state_dict 是从第一个客户端深拷贝的，所以这里无需任何操作。
-                pass
-
-        # 5. 将聚合后的新 state_dict 加载回服务器模型的 feature_extractor
-        self.model.feature_extractor.load_state_dict(aggregated_fe_state_dict)
-
-        return self.model
+        if len(models) == 0: return self.model
+        nan_exists = [m.has_nan() for m in models]
+        if any(nan_exists):
+            if all(nan_exists): raise ValueError("All the received local models have parameters of nan value.")
+            self.gv.logger.info(
+                'Warning("There exists nan-value in local models, which will be automatically removed from the aggregatino list.")')
+            new_models = []
+            received_clients = []
+            for ni, mi, cid in zip(nan_exists, models, self.received_clients):
+                if ni: continue
+                new_models.append(mi)
+                received_clients.append(cid)
+            self.received_clients = received_clients
+            models = new_models
+        local_data_vols = [c.datavol for c in self.clients]
+        total_data_vol = sum(local_data_vols)
+        if self.aggregation_option == 'weighted_scale':
+            p = [1.0 * local_data_vols[cid] / total_data_vol for cid in self.received_clients]
+            K = len(models)
+            N = self.num_clients
+            return fmodule._model_sum([model_k * pk for model_k, pk in zip(models, p)]) * N / K
+        elif self.aggregation_option == 'uniform':
+            return fmodule._model_average(models)
+        elif self.aggregation_option == 'weighted_com':
+            p = [1.0 * local_data_vols[cid] / total_data_vol for cid in self.received_clients]
+            w = fmodule._model_sum([model_k * pk for model_k, pk in zip(models, p)])
+            return (1.0 - sum(p)) * self.model + w
+        else:
+            p = [1.0 * local_data_vols[cid] / total_data_vol for cid in self.received_clients]
+            sump = sum(p)
+            p = [pk / sump for pk in p]
+            return fmodule._model_sum([model_k * pk for model_k, pk in zip(models, p)])
 
     def clients_contribution_to_weights(self, models):
         """辅助函数：根据配置计算客户端的聚合权重。"""
@@ -152,31 +187,163 @@ class Client(fedbase.BasicClient):
         self.current_round = 0
         self.task = self.option['task']
         self.head = None
+        # 用于保存每一轮蒸馏出的专家模型 (nn.Module 类型)
+        self.distilled_expert = None
 
+        # 从配置中获取蒸馏相关的超参数
+        self.distill_T = self.option.get('distill_T', 2.0)
+        self.distill_alpha = self.option.get('distill_alpha', 0.5)
+        self.distill_epochs = self.option.get('distill_epochs', 2)
+        # 为专家模型蒸馏单独指定学习率
+        self.distill_lr = self.option.get('distill_lr', 0.01)
 
     @fmodule.with_multi_gpus
     def train(self, model):
-        r"""
-        Standard local training procedure. Train the transmitted model with
-        local training dataset.
-
-        Args:
-            model (FModule): the global model
         """
+        本地计算的核心。
+        1. 正常训练从服务器接收的主模型 (FModule)。
+        2. 训练完成后，以此模型为教师，蒸馏出一个新的专家模型 (nn.Module)。
+        """
+        # ================== 阶段 A: 正常训练主模型 (FModule) ==================
+        # 这一部分完全使用 flgo 的标准流程
         model.train()
-        optimizer = self.calculator.get_optimizer(model, lr=self.learning_rate, weight_decay=self.weight_decay,
-                                                  momentum=self.momentum)
-        for iter in range(self.num_steps):
-            # get a batch of data
+        optimizer = self.calculator.get_optimizer(
+            model, lr=self.learning_rate, weight_decay=self.weight_decay, momentum=self.momentum
+        )
+
+        for _ in range(self.num_steps):
             batch_data = self.get_batch_data()
             model.zero_grad()
-            # calculate the loss of the model on batched dataset through task-specified calculator
             loss = self.calculator.compute_loss(model, batch_data)['loss']
             loss.backward()
-            if self.clip_grad > 0: torch.nn.utils.clip_grad_norm_(parameters=model.parameters(),
-                                                                  max_norm=self.clip_grad)
+            if self.clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(parameters=model.parameters(), max_norm=self.clip_grad)
             optimizer.step()
-        return
+
+        # ================== 阶段 B: 蒸馏出专家模型 (nn.Module) ==================
+        # 这一部分完全使用原生的 PyTorch 流程，与 flgo 解耦
+        teacher_model = model
+        teacher_model.eval()
+
+        # 1. 创建一个新的专家模型 (nn.Module)
+        expert_mlp = ExpertMLP(dim_in=512, dim_out=10).to(self.device)
+        expert_mlp.train()
+
+        # 2. 创建原生的优化器和损失函数
+        optimizer_expert = torch.optim.SGD(expert_mlp.parameters(), lr=self.distill_lr)
+        criterion_ce = nn.CrossEntropyLoss()
+
+        # 3. 进行多轮蒸馏训练
+        distill_loader = torch.utils.data.DataLoader(
+            self.train_data, batch_size=self.batch_size, shuffle=True, num_workers=self.loader_num_workers
+        )
+
+        for _ in range(self.distill_epochs):
+            for batch_data in distill_loader:
+                # flgo 的 get_batch_data 可能返回一个字典，我们需要解包
+                # 假设它返回的是 (inputs, labels)
+                if isinstance(batch_data, dict):
+                    inputs, labels = batch_data['data'], batch_data['label']
+                else:
+                    inputs, labels = batch_data
+
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                optimizer_expert.zero_grad()
+
+                # a. 获取教师的软标签和特征
+                with torch.no_grad():
+                    teacher_logits = teacher_model(inputs)
+                    features = teacher_model.feature_extractor(inputs)
+                    features = torch.flatten(features, 1)
+
+                # b. 获取专家的预测
+                expert_logits = expert_mlp(features)
+
+                # c. 计算总损失 (使用原生 PyTorch 函数)
+                loss_ce = criterion_ce(expert_logits, labels)
+
+                loss_kd = F.kl_div(
+                    F.log_softmax(expert_logits / self.distill_T, dim=1),
+                    F.softmax(teacher_logits / self.distill_T, dim=1),
+                    reduction='batchmean'
+                )
+
+                total_loss = (1 - self.distill_alpha) * loss_ce + self.distill_alpha * (self.distill_T ** 2) * loss_kd
+
+                total_loss.backward()
+                optimizer_expert.step()
+
+        # 4. 保存蒸馏出的专家模型作为“副产品”
+        self.distilled_expert = expert_mlp.to('cpu')  # 存到 CPU 以节省显存
+
+        # 使用【刚刚训练完的】主模型作为特征提取器，这是最准确的评估方式
+        self.test_distilled_expert(teacher_for_feature_extraction=teacher_model)
+
+        # 5. train 方法的最终返回值必须是训练好的【主模型 FModule】
+        return model
+
+    def test_distilled_expert(self, teacher_for_feature_extraction):
+        """
+        一个专门用于测试本地最新蒸馏出的专家模型的函数。
+        """
+        # 1. 检查专家模型和测试数据是否存在
+        if self.distilled_expert is None:
+            # print(f"Client {self.id}: No expert model to test.")
+            return
+
+        # flgo 中，客户端通常没有 self.test_data，而是有 self.val_data
+        # 我们优先使用 val_data，如果不存在，则尝试 test_data
+        if hasattr(self, 'test_data') and self.val_data:
+            dataset = self.val_data
+        elif hasattr(self, 'val_data') and self.test_data:
+            dataset = self.test_data
+        else:
+            print(f"Client {self.id}: No validation/test data for expert testing.")
+            return
+
+        # 2. 准备模型和数据
+        expert_to_test = self.distilled_expert.to(self.device)
+        expert_to_test.eval()
+
+        feature_extractor = teacher_for_feature_extraction.feature_extractor.to(self.device)
+        feature_extractor.eval()
+
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=self.test_batch_size)
+
+        # 3. 执行测试循环
+        num_correct = 0
+        total_samples = 0
+        with torch.no_grad():
+            for batch_data in dataloader:
+                if isinstance(batch_data, dict):
+                    inputs, labels = batch_data['data'], batch_data['label']
+                else:
+                    inputs, labels = batch_data
+
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                features = feature_extractor(inputs)
+                features = torch.flatten(features, 1)
+                logits = expert_to_test(features)
+
+                _, preds = torch.max(logits, 1)
+                num_correct += (preds == labels).sum().item()
+                total_samples += len(labels)
+
+        accuracy = num_correct / total_samples if total_samples > 0 else 0.0
+
+        # 4. 打印结果
+        # 使用 flgo 的 logger 来记录，这样结果会和主模型的测试结果一起出现在日志文件中
+        # logger 通常在 self.gv (global variables) 中
+        log_msg = f"Round {self.current_round}, Client {self.id}: Distilled Expert Accuracy = {accuracy:.4f}"
+        if hasattr(self, 'gv') and hasattr(self.gv, 'logger'):
+            self.gv.logger.info(log_msg)
+        else:
+            print(log_msg)
+
+        # 将专家模型移回 CPU 以节省显存
+        self.distilled_expert.to('cpu')
     
     @fmodule.with_multi_gpus
     def test(self, model, flag='val'):
