@@ -8,7 +8,7 @@ from torch.utils.data import random_split, DataLoader
 
 
 class ExpertMLP(nn.Module): # <-- 继承自 nn.Module
-    def __init__(self, dim_in=512, dim_hidden=128, dim_out=10):
+    def __init__(self, dim_in, dim_hidden, dim_out):
         super().__init__()
         self.fc1 = nn.Linear(dim_in, dim_hidden)
         self.relu = nn.ReLU()
@@ -21,13 +21,12 @@ class ExpertMLP(nn.Module): # <-- 继承自 nn.Module
         return x
 
 class GatingNetwork(nn.Module):
-    def __init__(self, dim_in, num_experts):
+    def __init__(self, dim_in, dim_hidden, num_experts):
         super().__init__()
-        # 可以设计一个简单的两层网络
         self.layer = nn.Sequential(
-            nn.Linear(dim_in, 128),
+            nn.Linear(dim_in, dim_hidden),
             nn.ReLU(),
-            nn.Linear(128, num_experts)
+            nn.Linear(dim_hidden, num_experts)
         )
 
     def forward(self, x):
@@ -38,6 +37,8 @@ class Server(fedbase.BasicServer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.client_experts = {}
+        self.feature_dim = self.option.get('feature_dim', 512)
+        self.gating_hidden_dim = self.option.get('gating_hidden_dim', 128)
 
 
     def initialize(self, *args, **kwargs):
@@ -74,17 +75,16 @@ class Server(fedbase.BasicServer):
             # 如果划分失败，保留原始的 test_data
             self.moe_test_data = original_test_data
 
-        # ====================  关 键 修 改 (1/3)  ====================
         # 在初始化时就创建好固定大小的门控网络
 
         # 假设总客户端数在此时已经可用
         self.num_total_clients = len(self.clients)
 
-        # 假设 ResNet18 的特征维度是 512，如果你的模型不同，需要修改这里
-        feature_dim = 512
-
-        # 创建一个一次性的、足够大的门控网络
-        self.gating_network = GatingNetwork(feature_dim, self.num_total_clients)
+        self.gating_network = GatingNetwork(
+            dim_in=self.feature_dim,
+            dim_hidden=self.gating_hidden_dim,
+            num_experts=self.num_total_clients
+        )
 
         # 创建优化器
         self.gating_lr = self.option.get('gating_lr', 0.001)
@@ -461,6 +461,10 @@ class Client(fedbase.BasicClient):
         self.server_gating_network = None
         self.server_client_experts = None
 
+        self.feature_dim = self.option.get('feature_dim', 512)
+        self.num_classes = self.option.get('num_classes', 10)
+        self.expert_hidden_dim = self.option.get('expert_hidden_dim', 128)
+
     @fmodule.with_multi_gpus
     def train(self, model):
         """
@@ -490,7 +494,11 @@ class Client(fedbase.BasicClient):
         teacher_model.eval()
 
         # 1. 创建一个新的专家模型 (nn.Module)
-        expert_mlp = ExpertMLP(dim_in=512, dim_out=10).to(self.device)
+        expert_mlp = ExpertMLP(
+            dim_in=self.feature_dim,
+            dim_hidden=self.expert_hidden_dim,
+            dim_out=self.num_classes
+        ).to(self.device)
         expert_mlp.train()
 
         # 2. 创建原生的优化器和损失函数

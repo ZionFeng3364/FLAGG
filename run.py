@@ -110,6 +110,42 @@ def parse_args():
     parser.add_argument('--log_level', type=str, default='INFO', choices=['INFO', 'DEBUG'],
                         help='日志级别')
 
+    # =================================================================
+    #          我们算法的专属超参数 (MoE and Distillation)
+    # =================================================================
+    parser.add_argument('--feature_dim', type=int, default=512,
+                        help='模型特征提取器的输出维度 (e.g., ResNet18 output)')
+    # num_classes 将通过 get_dataset_module 自动获取，不需要作为参数
+
+    parser.add_argument('--expert_hidden_dim', type=int, default=128,
+                        help='专家模型(MLP)的隐藏层维度')
+    parser.add_argument('--gating_hidden_dim', type=int, default=128,
+                        help='门控网络的隐藏层维度')
+
+    # MoE 训练参数
+    parser.add_argument('--gating_lr', type=float, default=0.001,
+                        help='门控网络的学习率')
+    parser.add_argument('--gating_epochs', type=int, default=10,
+                        help='门控网络的训练轮数')
+    parser.add_argument('--moe_k', type=int, default=2,
+                        help='Top-K Gating 中的 K 值')
+    parser.add_argument('--balance_loss_alpha', type=float, default=0.01,
+                        help='负载均衡损失的权重系数')
+
+    # 知识蒸馏参数
+    parser.add_argument('--distill_lr', type=float, default=0.01,
+                        help='专家蒸馏的学习率')
+    parser.add_argument('--distill_epochs', type=int, default=3,
+                        help='专家蒸馏的训练轮数')
+    parser.add_argument('--distill_T', type=float, default=2.0,
+                        help='知识蒸馏的温度系数 T')
+    parser.add_argument('--distill_alpha', type=float, default=0.5,
+                        help='知识蒸馏中KD损失的权重 alpha')
+
+    # 服务器验证集划分比例
+    parser.add_argument('--val_split_ratio', type=float, default=0.5,
+                        help='从服务器测试集中划分验证集的比例')
+
     return parser.parse_args()
 
 def set_seed(seed):
@@ -231,6 +267,23 @@ def main():
             'test_holdout': args.test_holdout,
             'eval_interval': args.eval_interval,
             'log_level': args.log_level,
+            # ================== 新增的 MoE 和蒸馏参数 ==================
+            'num_classes': num_classes,  # 从 get_dataset_module 获取
+            'feature_dim': args.feature_dim,
+            'expert_hidden_dim': args.expert_hidden_dim,
+            'gating_hidden_dim': args.gating_hidden_dim,
+
+            'gating_lr': args.gating_lr,
+            'gating_epochs': args.gating_epochs,
+            'moe_k': args.moe_k,
+            'balance_loss_alpha': args.balance_loss_alpha,
+
+            'distill_lr': args.distill_lr,
+            'distill_epochs': args.distill_epochs,
+            'distill_T': args.distill_T,
+            'distill_alpha': args.distill_alpha,
+
+            'val_split_ratio': args.val_split_ratio,
         },
         model=model,
         Logger=ClassicalLogger,
