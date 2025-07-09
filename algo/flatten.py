@@ -142,15 +142,28 @@ class Server(fedbase.BasicServer):
 
     def train_gating_network(self):
         """
-        训练门控网络。现在它处理固定大小的输出和动态的活跃专家。
+        训练门控网络。现在它处理固定大小的输出和动态的活跃专家，
+        并使用 Top-K Gating 策略。
         """
         # 获取当前轮次可用的专家
         active_expert_cids = sorted(list(self.client_experts.keys()))
-        if len(active_expert_cids) < 2 or not self.val_data:
+        if len(active_expert_cids) < 2 or not self.val_data:  # Top-K 至少需要2个专家才有意义
             self.gv.logger.info("Skipping gating network training: Not enough experts or no validation data.")
             return
 
-        self.gv.logger.info(f"Training Gating Network with {len(active_expert_cids)} active experts...")
+        # ====================  超参数定义  ====================
+        # 你可以把这些超参数移动到 __init__ 中，通过 self.option 获取
+        K = self.option.get('moe_k', 5)  # 选择 Top-K 的 K 值，默认为 2
+        use_load_balancing_loss = self.option.get('use_load_balancing_loss', True)  # 是否使用负载均衡损失
+        balance_loss_alpha = self.option.get('balance_loss_alpha', 0.01)  # 负载均衡损失的权重
+        # ======================================================
+
+        # 确保 K 的值不超过当前活跃专家的数量
+        if K > len(active_expert_cids):
+            K = len(active_expert_cids)
+
+        self.gv.logger.info(
+            f"Training Gating Network with {len(active_expert_cids)} active experts using Top-{K} Gating...")
 
         # 准备模型
         gating_network = self.gating_network.to(self.device)
@@ -158,6 +171,8 @@ class Server(fedbase.BasicServer):
         feature_extractor = self.model.feature_extractor.to(self.device)
         feature_extractor.eval()
         active_experts = {cid: self.client_experts[cid].to(self.device) for cid in active_expert_cids}
+        for expert in active_experts.values():
+            expert.eval()  # 专家在门控训练时应处于评估模式
 
         dataloader = DataLoader(self.val_data, batch_size=self.option['test_batch_size'], shuffle=True)
         criterion = nn.CrossEntropyLoss()
@@ -175,26 +190,50 @@ class Server(fedbase.BasicServer):
                 with torch.no_grad():
                     features = torch.flatten(feature_extractor(inputs), 1)
 
-                # ====================  关 键 修 改 (2/3)  ====================
-                # 1. 门控网络预测所有可能专家的权重 (输出维度是固定的)
+                # ====================  Top-K Gating 核心逻辑 (训练) ====================
+                # 1. 门控网络预测所有可能专家的 logits
                 all_gating_logits = gating_network(features)
 
-                # 2. 只抽取出当前 "活跃" 专家的logits
-                # active_expert_cids 就是我们需要的索引！
+                # 2. 只抽取出当前 "活跃" 专家的 logits
                 active_gating_logits = all_gating_logits[:, active_expert_cids]
 
-                # 3. 在活跃专家的logits上应用softmax，得到它们的相对权重
-                active_gating_weights = F.softmax(active_gating_logits, dim=1).unsqueeze(-1)
-                # =============================================================
+                # 3. 找到 Top-K 的 logits 和它们在 active_expert_cids 列表中的索引
+                top_k_logits, top_k_indices = torch.topk(active_gating_logits, K, dim=1)
 
-                # 4. 获取活跃专家的预测
-                # 确保顺序与 active_expert_cids 一致
+                # 4. 在 Top-K 的 logits 上应用 softmax，得到它们的相对权重
+                top_k_weights = F.softmax(top_k_logits, dim=1).unsqueeze(-1)
+
+                # 5. 高效地获取 Top-K 专家的输出
+                # 创建一个包含所有活跃专家输出的张量
                 expert_outputs = torch.stack([active_experts[cid](features) for cid in active_expert_cids])
-                expert_outputs = expert_outputs.permute(1, 0, 2)
+                expert_outputs = expert_outputs.permute(1, 0, 2)  # shape: [batch, num_experts, num_classes]
 
-                # 5. 加权求和并计算损失
-                final_output = (active_gating_weights * expert_outputs).sum(dim=1)
-                loss = criterion(final_output, labels)
+                # 使用 gather 函数根据 top_k_indices 选择对应的专家输出
+                # 需要将索引张量扩展到与输出张量匹配的维度
+                expanded_indices = top_k_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1))
+                top_k_expert_outputs = torch.gather(expert_outputs, 1, expanded_indices)
+
+                # 6. 加权求和得到最终输出
+                final_output = (top_k_weights * top_k_expert_outputs).sum(dim=1)
+                # =========================================================================
+
+                # 7. 计算损失
+                main_loss = criterion(final_output, labels)
+
+                # (可选) 计算负载均衡损失
+                if use_load_balancing_loss:
+                    # 在所有活跃专家的 logits 上计算 softmax，以了解路由分布
+                    gating_probabilities = F.softmax(active_gating_logits, dim=1)
+                    # 计算每个专家在 batch 中的平均选择概率
+                    importance_per_expert = torch.mean(gating_probabilities, dim=0)
+                    # 计算负载均衡损失 (coefficient of variation squared)
+                    # 这个损失会惩罚重要性分布不均的情况
+                    load_balancing_loss = torch.var(importance_per_expert) / (torch.mean(importance_per_expert) ** 2)
+
+                    loss = main_loss + balance_loss_alpha * load_balancing_loss
+                else:
+                    loss = main_loss
+
                 loss.backward()
                 self.gating_optimizer.step()
 
@@ -204,18 +243,28 @@ class Server(fedbase.BasicServer):
 
     def test_moe_system(self):
         """
-        评估MoE系统，逻辑与训练时类似。
+        评估MoE系统，使用与训练时一致的 Top-K Gating 策略。
         """
         active_expert_cids = sorted(list(self.client_experts.keys()))
         if self.gating_network is None or not self.moe_test_data or len(active_expert_cids) < 1:
             self.gv.logger.info("Skipping MoE system evaluation: Components are not ready.")
             return {}
 
+        # ====================  超参数定义  ====================
+        K = self.option.get('moe_k', 5)  # 确保与训练时使用的 K 值一致
+        # ======================================================
+
+        # 确保 K 的值不超过当前活跃专家的数量
+        if K > len(active_expert_cids):
+            K = len(active_expert_cids)
+
         gating_network = self.gating_network.to(self.device)
         gating_network.eval()
         feature_extractor = self.model.feature_extractor.to(self.device)
         feature_extractor.eval()
         active_experts = {cid: self.client_experts[cid].to(self.device) for cid in active_expert_cids}
+        for expert in active_experts.values():
+            expert.eval()
 
         dataloader = DataLoader(self.moe_test_data, batch_size=self.option['test_batch_size'])
         total_loss, num_correct, total_samples = 0, 0, 0
@@ -231,17 +280,21 @@ class Server(fedbase.BasicServer):
 
                 features = torch.flatten(feature_extractor(inputs), 1)
 
-                # ====================  关 键 修 改 (3/3)  ====================
-                # 评估时也遵循同样的逻辑
+                # ====================  Top-K Gating 核心逻辑 (测试) ====================
                 all_gating_logits = gating_network(features)
                 active_gating_logits = all_gating_logits[:, active_expert_cids]
-                active_gating_weights = F.softmax(active_gating_logits, dim=1).unsqueeze(-1)
-                # =============================================================
+
+                top_k_logits, top_k_indices = torch.topk(active_gating_logits, K, dim=1)
+                top_k_weights = F.softmax(top_k_logits, dim=1).unsqueeze(-1)
 
                 expert_outputs = torch.stack([active_experts[cid](features) for cid in active_expert_cids])
                 expert_outputs = expert_outputs.permute(1, 0, 2)
 
-                final_output = (active_gating_weights * expert_outputs).sum(dim=1)
+                expanded_indices = top_k_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1))
+                top_k_expert_outputs = torch.gather(expert_outputs, 1, expanded_indices)
+
+                final_output = (top_k_weights * top_k_expert_outputs).sum(dim=1)
+                # =========================================================================
 
                 total_loss += criterion(final_output, labels).item()
                 _, preds = torch.max(final_output, 1)
@@ -251,7 +304,8 @@ class Server(fedbase.BasicServer):
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
         accuracy = num_correct / total_samples if total_samples > 0 else 0
         metrics = {'test_moe_accuracy': accuracy, 'test_moe_loss': avg_loss}
-        self.gv.logger.info(f"MoE System Evaluation on MoE Test Set: Accuracy = {accuracy:.4f}, Loss = {avg_loss:.4f}")
+        self.gv.logger.info(
+            f"MoE System Evaluation on MoE Test Set (Top-{K}): Accuracy = {accuracy:.4f}, Loss = {avg_loss:.4f}")
 
         gating_network.to('cpu')
         for expert in active_experts.values():
@@ -399,7 +453,7 @@ class Client(fedbase.BasicClient):
         # 从配置中获取蒸馏相关的超参数
         self.distill_T = self.option.get('distill_T', 2.0)
         self.distill_alpha = self.option.get('distill_alpha', 0.5)
-        self.distill_epochs = self.option.get('distill_epochs', 2)
+        self.distill_epochs = self.option.get('distill_epochs', 3)
         # 为专家模型蒸馏单独指定学习率
         self.distill_lr = self.option.get('distill_lr', 0.01)
 
