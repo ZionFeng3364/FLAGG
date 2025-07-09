@@ -524,9 +524,9 @@ class Client(fedbase.BasicClient):
 
         # flgo 中，客户端通常没有 self.test_data，而是有 self.val_data
         # 我们优先使用 val_data，如果不存在，则尝试 test_data
-        if hasattr(self, 'test_data') and self.val_data:
+        if hasattr(self, 'test_data') and self.test_data:
             dataset = self.test_data
-        elif hasattr(self, 'val_data') and self.test_data:
+        elif hasattr(self, 'val_data') and self.val_data:
             dataset = self.val_data
         else:
             print(f"Client {self.id}: No validation/test data for expert testing.")
@@ -662,9 +662,9 @@ class Client(fedbase.BasicClient):
         """
         # 1. 确定使用哪个数据集进行测试
         # 优先使用客户端的验证集 `val_data`，如果不存在，则使用测试集 `test_data`
-        if hasattr(self, 'test_data') and self.val_data:
+        if hasattr(self, 'test_data') and self.test_data:
             dataset = self.test_data
-        elif hasattr(self, 'val_data') and self.test_data:
+        elif hasattr(self, 'val_data') and self.val_data:
             dataset = self.val_data
         else:
             self.gv.logger.warning(f"Client {self.id}: No local data for MoE system evaluation.")
