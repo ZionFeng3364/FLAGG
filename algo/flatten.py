@@ -384,22 +384,6 @@ class Server(fedbase.BasicServer):
             p = [pk / sump for pk in p]
             return fmodule._model_sum([model_k * pk for model_k, pk in zip(models, p)])
 
-    def clients_contribution_to_weights(self, models):
-        """辅助函数：根据配置计算客户端的聚合权重。"""
-        # 默认使用均匀权重
-        weights = [1.0 / len(models)] * len(models)
-
-        # 如果配置为数据量加权
-        if self.aggregation_option != 'uniform':
-            local_data_vols = [self.clients[cid].datavol for cid in self.received_clients]
-            total_data_vol = sum(local_data_vols)
-            if total_data_vol > 0:
-                if self.aggregation_option == 'weighted_com':
-                    weights = [vol / total_data_vol for vol in local_data_vols]
-                else:
-                    weights = [vol / sum(local_data_vols) for vol in local_data_vols]
-        return weights
-
 
 
 class Client(fedbase.BasicClient):
