@@ -270,9 +270,15 @@ class Server(fedbase.BasicServer):
         Returns:
             a dict contains necessary information (e.g. a copy of the global model as default)
         """
+        # 为了避免传输大量模型到GPU，我们确保所有要打包的模型都在CPU上
+        gating_network_cpu = self.gating_network.to('cpu')
+        experts_cpu = {cid: expert.to('cpu') for cid, expert in self.client_experts.items()}
+
         return {
             "model": copy.deepcopy(self.model),
-            "current_round": self.current_round
+            "current_round": self.current_round,
+            "gating_network": copy.deepcopy(gating_network_cpu),
+            "client_experts": copy.deepcopy(experts_cpu)
         }
     
     def test(self, model=None, flag:str='test'):
@@ -413,6 +419,10 @@ class Client(fedbase.BasicClient):
         # 为专家模型蒸馏单独指定学习率
         self.distill_lr = self.option.get('distill_lr', 0.01)
 
+        # 用于暂存从服务器接收的MoE系统组件
+        self.server_gating_network = None
+        self.server_client_experts = None
+
     @fmodule.with_multi_gpus
     def train(self, model):
         """
@@ -494,7 +504,11 @@ class Client(fedbase.BasicClient):
         self.distilled_expert = expert_mlp.to('cpu')  # 存到 CPU 以节省显存
 
         # 使用【刚刚训练完的】主模型作为特征提取器，这是最准确的评估方式
-        self.test_distilled_expert(teacher_for_feature_extraction=teacher_model)
+        # self.test_distilled_expert(teacher_for_feature_extraction=teacher_model)
+
+        # 检查是否从服务器收到了MoE系统组件
+        if self.server_gating_network and self.server_client_experts:
+            self.test_server_moe_on_local_data(model)
 
         # 5. train 方法的最终返回值必须是训练好的【主模型 FModule】
         return model
@@ -511,9 +525,9 @@ class Client(fedbase.BasicClient):
         # flgo 中，客户端通常没有 self.test_data，而是有 self.val_data
         # 我们优先使用 val_data，如果不存在，则尝试 test_data
         if hasattr(self, 'test_data') and self.val_data:
-            dataset = self.val_data
-        elif hasattr(self, 'val_data') and self.test_data:
             dataset = self.test_data
+        elif hasattr(self, 'val_data') and self.test_data:
+            dataset = self.val_data
         else:
             print(f"Client {self.id}: No validation/test data for expert testing.")
             return
@@ -627,6 +641,8 @@ class Client(fedbase.BasicClient):
         解包服务器消息：接收全局模型，并将其 head 替换为自己的私有 head。
         """
         global_model = received_pkg['model']
+        self.server_gating_network = received_pkg.get('gating_network')
+        self.server_client_experts = received_pkg.get('client_experts')
 
         # 如果是第一轮，客户端还没有自己的私有 head，
         # 就从服务器下发的模型中复制一个作为初始化的 head。
@@ -639,3 +655,77 @@ class Client(fedbase.BasicClient):
 
         # 将组合后的模型传递给后续的 train 方法
         return model_to_train
+
+    def test_server_moe_on_local_data(self, main_model_for_feature_extraction):
+        """
+        在客户端自己的测试/验证数据上，评估从服务器下发的MoE系统。
+        """
+        # 1. 确定使用哪个数据集进行测试
+        # 优先使用客户端的验证集 `val_data`，如果不存在，则使用测试集 `test_data`
+        if hasattr(self, 'test_data') and self.val_data:
+            dataset = self.test_data
+        elif hasattr(self, 'val_data') and self.test_data:
+            dataset = self.val_data
+        else:
+            self.gv.logger.warning(f"Client {self.id}: No local data for MoE system evaluation.")
+            return
+
+        # 2. 准备模型和数据
+        # 将所有需要的模型移到客户端的设备上
+        gating_network = self.server_gating_network.to(self.device)
+        gating_network.eval()
+
+        # 从主模型中获取最新的特征提取器
+        feature_extractor = main_model_for_feature_extraction.feature_extractor.to(self.device)
+        feature_extractor.eval()
+
+        # 准备所有专家模型
+        active_experts = {cid: expert.to(self.device) for cid, expert in self.server_client_experts.items()}
+        for expert in active_experts.values():
+            expert.eval()
+
+        # 注意：这里的 active_expert_cids 必须与服务器端训练时使用的顺序一致
+        # 我们假设服务器端是用 sorted keys 训练的
+        active_expert_cids = sorted(list(active_experts.keys()))
+
+        dataloader = DataLoader(dataset, batch_size=self.test_batch_size)
+        total_loss, num_correct, total_samples = 0, 0, 0
+        criterion = nn.CrossEntropyLoss(reduction='sum')
+
+        # 3. 执行评估循环
+        with torch.no_grad():
+            for batch_data in dataloader:
+                if isinstance(batch_data, dict):
+                    inputs, labels = batch_data['data'], batch_data['label']
+                else:
+                    inputs, labels = batch_data
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                features = torch.flatten(feature_extractor(inputs), 1)
+
+                all_gating_logits = gating_network(features)
+                active_gating_logits = all_gating_logits[:, active_expert_cids]
+                active_gating_weights = F.softmax(active_gating_logits, dim=1).unsqueeze(-1)
+
+                expert_outputs = torch.stack([active_experts[cid](features) for cid in active_expert_cids])
+                expert_outputs = expert_outputs.permute(1, 0, 2)
+
+                final_output = (active_gating_weights * expert_outputs).sum(dim=1)
+
+                total_loss += criterion(final_output, labels).item()
+                _, preds = torch.max(final_output, 1)
+                num_correct += (preds == labels).sum().item()
+                total_samples += len(labels)
+
+        # 4. 计算并打印结果
+        if total_samples > 0:
+            avg_loss = total_loss / total_samples
+            accuracy = num_correct / total_samples
+
+            log_msg = f"\nClient {self.id} evaluated Server's MoE System on its local data: Accuracy = {accuracy:.4f}, Loss = {avg_loss:.4f}"
+            self.gv.logger.info(log_msg)
+
+        # 5. 清理GPU资源
+        gating_network.to('cpu')
+        for expert in active_experts.values():
+            expert.to('cpu')
