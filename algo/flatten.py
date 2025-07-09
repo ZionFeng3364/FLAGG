@@ -4,7 +4,8 @@ from flgo.algorithm import fedbase
 from flgo.utils import fmodule
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import random_split
+from torch.utils.data import random_split, DataLoader
+
 
 class ExpertMLP(nn.Module): # <-- 继承自 nn.Module
     def __init__(self, dim_in=512, dim_hidden=128, dim_out=10):
@@ -19,10 +20,25 @@ class ExpertMLP(nn.Module): # <-- 继承自 nn.Module
         x = self.fc2(x)
         return x
 
+class GatingNetwork(nn.Module):
+    def __init__(self, dim_in, num_experts):
+        super().__init__()
+        # 可以设计一个简单的两层网络
+        self.layer = nn.Sequential(
+            nn.Linear(dim_in, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_experts)
+        )
+
+    def forward(self, x):
+        # 输出原始的 logits，softmax 将在训练/推理逻辑中应用
+        return self.layer(x)
+
 class Server(fedbase.BasicServer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.client_experts = {}
+
 
     def initialize(self, *args, **kwargs):
         """
@@ -45,18 +61,39 @@ class Server(fedbase.BasicServer):
 
         # 使用 PyTorch 的 random_split 函数进行划分
         try:
-            self.val_data, self.test_data = random_split(
+            self.val_data, self.moe_test_data = random_split(
                 original_test_data,
                 [val_size, test_size],
                 generator=generator
             )
             self.gv.logger.info(f"Server's original test data (size: {len(original_test_data)}) has been split.")
             self.gv.logger.info(f"New server validation set ('val_data') size: {len(self.val_data)}")
-            self.gv.logger.info(f"New server test set ('test_data') size: {len(self.test_data)}")
+            self.gv.logger.info(f"New server test set ('moe_test_data') size: {len(self.moe_test_data)}")
         except Exception as e:
             self.gv.logger.error(f"Failed to split server's test data: {e}")
             # 如果划分失败，保留原始的 test_data
-            self.test_data = original_test_data
+            self.moe_test_data = original_test_data
+
+        # ====================  关 键 修 改 (1/3)  ====================
+        # 在初始化时就创建好固定大小的门控网络
+
+        # 假设总客户端数在此时已经可用
+        self.num_total_clients = len(self.clients)
+
+        # 假设 ResNet18 的特征维度是 512，如果你的模型不同，需要修改这里
+        feature_dim = 512
+
+        # 创建一个一次性的、足够大的门控网络
+        self.gating_network = GatingNetwork(feature_dim, self.num_total_clients)
+
+        # 创建优化器
+        self.gating_lr = self.option.get('gating_lr', 0.001)
+        self.gating_optimizer = torch.optim.Adam(self.gating_network.parameters(), lr=self.gating_lr)
+
+        self.gating_epochs = self.option.get('gating_epochs', 5)
+        self.gv.logger.info(
+            f"Initialized a fixed-size Gating Network for {self.num_total_clients} total possible experts.")
+        # =============================================================
         return
 
     def iterate(self):
@@ -68,13 +105,10 @@ class Server(fedbase.BasicServer):
         if not self.selected_clients:
             return False
 
-        # 2. 与客户端通信，接收完整的包 (有变化)
-        # 旧代码: models = self.communicate(self.selected_clients)['model']
-        # 新代码: 我们接收完整的 packages，而不仅仅是 'model'
+        # 2. 与客户端通信，接收完整的包
         packages_received = self.communicate(self.selected_clients)
 
         # 从收到的包中解压出主模型、专家模型和客户端ID
-        # .get(key, []) 是一种安全写法，如果某个key不存在，会返回一个空列表
         main_models = packages_received.get('model', [])
         expert_models = packages_received.get('distilled_expert', [])
 
@@ -89,13 +123,140 @@ class Server(fedbase.BasicServer):
                 # (可选) 打印日志，确认收到
                 # self.gv.logger.info(f"Server: Received and stored expert from Client {cid}.")
 
-        # 4. 聚合主模型 (无变化)
-        if main_models:
-            self.model = self.aggregate(main_models)
-            return True
-        else:
-            # 如果没有收到任何模型，则此轮无效
+        # 如果没有收到任何模型，本轮可能无效，提前返回
+        if not main_models:
             return False
+
+        self.model = self.aggregate(main_models)
+
+        # 2. 训练门控网络
+        self.train_gating_network()
+
+        # 3. 评估 MoE 专家系统 (调用我们新写的独立方法)
+        self.gv.logger.info("------ Evaluating MoE Expert System ------")
+        self.test_moe_system()
+
+        self.gv.logger.info(f"==========================================================")
+
+        return True  # 表示本轮迭代成功
+
+    def train_gating_network(self):
+        """
+        训练门控网络。现在它处理固定大小的输出和动态的活跃专家。
+        """
+        # 获取当前轮次可用的专家
+        active_expert_cids = sorted(list(self.client_experts.keys()))
+        if len(active_expert_cids) < 2 or not self.val_data:
+            self.gv.logger.info("Skipping gating network training: Not enough experts or no validation data.")
+            return
+
+        self.gv.logger.info(f"Training Gating Network with {len(active_expert_cids)} active experts...")
+
+        # 准备模型
+        gating_network = self.gating_network.to(self.device)
+        gating_network.train()
+        feature_extractor = self.model.feature_extractor.to(self.device)
+        feature_extractor.eval()
+        active_experts = {cid: self.client_experts[cid].to(self.device) for cid in active_expert_cids}
+
+        dataloader = DataLoader(self.val_data, batch_size=self.option['test_batch_size'], shuffle=True)
+        criterion = nn.CrossEntropyLoss()
+
+        for epoch in range(self.gating_epochs):
+            for batch_data in dataloader:
+                if isinstance(batch_data, dict):
+                    inputs, labels = batch_data['data'], batch_data['label']
+                else:
+                    inputs, labels = batch_data
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                self.gating_optimizer.zero_grad()
+
+                with torch.no_grad():
+                    features = torch.flatten(feature_extractor(inputs), 1)
+
+                # ====================  关 键 修 改 (2/3)  ====================
+                # 1. 门控网络预测所有可能专家的权重 (输出维度是固定的)
+                all_gating_logits = gating_network(features)
+
+                # 2. 只抽取出当前 "活跃" 专家的logits
+                # active_expert_cids 就是我们需要的索引！
+                active_gating_logits = all_gating_logits[:, active_expert_cids]
+
+                # 3. 在活跃专家的logits上应用softmax，得到它们的相对权重
+                active_gating_weights = F.softmax(active_gating_logits, dim=1).unsqueeze(-1)
+                # =============================================================
+
+                # 4. 获取活跃专家的预测
+                # 确保顺序与 active_expert_cids 一致
+                expert_outputs = torch.stack([active_experts[cid](features) for cid in active_expert_cids])
+                expert_outputs = expert_outputs.permute(1, 0, 2)
+
+                # 5. 加权求和并计算损失
+                final_output = (active_gating_weights * expert_outputs).sum(dim=1)
+                loss = criterion(final_output, labels)
+                loss.backward()
+                self.gating_optimizer.step()
+
+        gating_network.to('cpu')
+        for expert in active_experts.values():
+            expert.to('cpu')
+
+    def test_moe_system(self):
+        """
+        评估MoE系统，逻辑与训练时类似。
+        """
+        active_expert_cids = sorted(list(self.client_experts.keys()))
+        if self.gating_network is None or not self.moe_test_data or len(active_expert_cids) < 1:
+            self.gv.logger.info("Skipping MoE system evaluation: Components are not ready.")
+            return {}
+
+        gating_network = self.gating_network.to(self.device)
+        gating_network.eval()
+        feature_extractor = self.model.feature_extractor.to(self.device)
+        feature_extractor.eval()
+        active_experts = {cid: self.client_experts[cid].to(self.device) for cid in active_expert_cids}
+
+        dataloader = DataLoader(self.moe_test_data, batch_size=self.option['test_batch_size'])
+        total_loss, num_correct, total_samples = 0, 0, 0
+        criterion = nn.CrossEntropyLoss(reduction='sum')
+
+        with torch.no_grad():
+            for batch_data in dataloader:
+                if isinstance(batch_data, dict):
+                    inputs, labels = batch_data['data'], batch_data['label']
+                else:
+                    inputs, labels = batch_data
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                features = torch.flatten(feature_extractor(inputs), 1)
+
+                # ====================  关 键 修 改 (3/3)  ====================
+                # 评估时也遵循同样的逻辑
+                all_gating_logits = gating_network(features)
+                active_gating_logits = all_gating_logits[:, active_expert_cids]
+                active_gating_weights = F.softmax(active_gating_logits, dim=1).unsqueeze(-1)
+                # =============================================================
+
+                expert_outputs = torch.stack([active_experts[cid](features) for cid in active_expert_cids])
+                expert_outputs = expert_outputs.permute(1, 0, 2)
+
+                final_output = (active_gating_weights * expert_outputs).sum(dim=1)
+
+                total_loss += criterion(final_output, labels).item()
+                _, preds = torch.max(final_output, 1)
+                num_correct += (preds == labels).sum().item()
+                total_samples += len(labels)
+
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        accuracy = num_correct / total_samples if total_samples > 0 else 0
+        metrics = {'test_moe_accuracy': accuracy, 'test_moe_loss': avg_loss}
+        self.gv.logger.info(f"MoE System Evaluation on MoE Test Set: Accuracy = {accuracy:.4f}, Loss = {avg_loss:.4f}")
+
+        gating_network.to('cpu')
+        for expert in active_experts.values():
+            expert.to('cpu')
+        return metrics
 
     def pack(self, client_id, mtype=0, *args, **kwargs):
         r"""
