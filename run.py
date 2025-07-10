@@ -22,6 +22,7 @@ import flgo.algorithm.ditto as ditto
 import algo.flatten as flatten
 from models.cifar10_resnet18 import CIFAR10ResNet18
 from models.cifar100_resnet18 import CIFAR100ResNet18
+from models.fashion_model import FashionResNet18
 from utils.logger import ClassicalLogger  # 经典联邦算法需要使用该Logger进行测试和记录
 from flgo.experiment.logger.pfl_logger import PFLLogger # PFL算法需要使用该Logger进行测试和记录
 
@@ -182,6 +183,8 @@ def get_model(dataset_name):
     elif dataset_name == 'femnist':
         from models.femnist_model import FEMNISTModel
         return FEMNISTModel
+    elif dataset_name == 'fashion':
+        return FashionResNet18
     else:
         raise ValueError(f"不支持的数据集: {dataset_name}")
 
