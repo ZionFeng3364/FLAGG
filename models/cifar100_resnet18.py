@@ -5,38 +5,36 @@ import torch
 
 
 class CIFAR100FResNet18(FModule):
-    def __init__(self, num_classes=100):  # 默认类别数为100
+    def __init__(self, num_classes=100):
         super().__init__()
-
-        # 加载预定义的 resnet18 模型，不加载预训练权重
-        resnet = models.resnet18(pretrained=False)
-
-        # 1. 定义特征提取器 (feature_extractor)
-        # 它包含 ResNet 中除了最后一个全连接层之外的所有层
+        # 定义一个简单的CNN结构，替代复杂的ResNet18
+        # 特征提取器部分
         self.feature_extractor = nn.Sequential(
-            # 修改第一层卷积以适应CIFAR100 (32x32)
-            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            resnet.bn1,
-            resnet.relu,
-            # 替换原来的 maxpool，避免过早减小特征图尺寸
-            nn.Identity(),
-            resnet.layer1,
-            resnet.layer2,
-            resnet.layer3,
-            resnet.layer4,
-            resnet.avgpool
+            # Block 1: 32x32 -> 14x14
+            nn.Conv2d(3, 64, kernel_size=5, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # Block 2: 14x14 -> 6x6
+            nn.Conv2d(64, 128, kernel_size=5, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
         )
 
-        # 2. 定义分类头 (head)
-        # 它就是原来的全连接层，输出类别为 num_classes
-        self.head = nn.Linear(resnet.fc.in_features, num_classes)
+        # 分类头部分
+        self.head = nn.Sequential(
+            # 输入维度需要根据feature_extractor的输出计算：128 * 6 * 6 = 4608
+            nn.Linear(128 * 6 * 6, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.5),  # 加入Dropout防止过拟合
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_classes)
+        )
 
     def forward(self, x):
-        """
-        前向传播：先通过特征提取器，然后展平，最后通过分类头。
-        """
         features = self.feature_extractor(x)
-        # 在特征提取器和分类头之间需要一个展平操作
+        # 展平特征
         features_flattened = torch.flatten(features, 1)
         out = self.head(features_flattened)
         return out
