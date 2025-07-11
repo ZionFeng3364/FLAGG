@@ -20,6 +20,7 @@ import flgo.algorithm.moon as moon
 import flgo.algorithm.feddyn as feddyn
 import flgo.algorithm.ditto as ditto
 import algo.flatten as flatten
+import algo.gradma as gradma
 from models.cifar10_resnet18 import CIFAR10ResNet18
 from models.cifar100_resnet18 import CIFAR100ResNet18
 from models.fashion_model import FashionResNet18
@@ -58,7 +59,7 @@ def parse_args():
 
     # 实验任务相关参数
     parser.add_argument('--algorithm', type=str, default='FLAtten',
-                        choices=['FedAvg', 'FLAtten', 'FedProx', 'Scaffold', 'FedNova', 'MOON', 'FedDyn', 'FedgradMA', 'Ditto'],
+                        choices=['FedAvg', 'FLAtten', 'FedProx', 'Scaffold', 'FedNova', 'MOON', 'FedDyn', 'GradMA', 'Ditto'],
                         help='联邦学习算法')
     parser.add_argument('--gen_task', action='store_true',
                         help='是否重新生成任务')
@@ -219,6 +220,8 @@ def main():
         algorithm = feddyn
     elif args.algorithm == 'Ditto':
         algorithm = ditto
+    elif args.algorithm == 'GradMA':
+        algorithm = gradma
     else:
         algorithm = fedavg
 
