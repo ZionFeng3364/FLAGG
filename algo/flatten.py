@@ -21,17 +21,40 @@ class ExpertMLP(nn.Module): # <-- 继承自 nn.Module
         return x
 
 class GatingNetwork(nn.Module):
-    def __init__(self, dim_in, dim_hidden, num_experts):
+    def __init__(self, dim_in, dim_hidden, num_experts, dropout_rate=0.1):
         super().__init__()
+        # 更深的网络架构
         self.layer = nn.Sequential(
             nn.Linear(dim_in, dim_hidden),
+            nn.BatchNorm1d(dim_hidden),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
+
+            nn.Linear(dim_hidden, dim_hidden),
+            nn.BatchNorm1d(dim_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+
             nn.Linear(dim_hidden, num_experts)
         )
 
+        # 添加注意力机制
+        self.attention = nn.MultiheadAttention(dim_hidden, num_heads=8, dropout=dropout_rate)
+        self.feature_transform = nn.Linear(dim_in, dim_hidden)
+
     def forward(self, x):
-        # 输出原始的 logits，softmax 将在训练/推理逻辑中应用
-        return self.layer(x)
+        # 标准路径
+        standard_output = self.layer(x)
+
+        # 注意力增强路径
+        transformed_x = self.feature_transform(x).unsqueeze(0)  # (1, batch, dim)
+        attended_x, _ = self.attention(transformed_x, transformed_x, transformed_x)
+        attended_x = attended_x.squeeze(0)  # (batch, dim)
+        attention_output = nn.Linear(self.feature_transform.out_features,
+                                     standard_output.size(1)).to(x.device)(attended_x)
+
+        # 融合两个路径
+        return standard_output + 0.3 * attention_output
 
 class Server(fedbase.BasicServer):
     def __init__(self, *args, **kwargs):
